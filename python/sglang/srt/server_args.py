@@ -1684,13 +1684,17 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
+                    if is_hip() and not getattr(self, "enable_hisparse", False):
                         self.page_size = 1
                         logger.warning(
                             "Setting page size to 1 for DeepSeek DSA on ROCm."
                         )
                     else:
-                        # For CUDA GPU
+                        # For CUDA GPU, or ROCm with HiSparse (which requires
+                        # page_size > 1 in HiSparseAllocator). Note: on ROCm
+                        # this requires PR2 (AITER load_cache_to_device_buffer
+                        # ROCm kernel) and PR3 (AITER MLA decode heuristic for
+                        # page_size=64) to be effective end-to-end.
                         self.page_size = 64
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")
 

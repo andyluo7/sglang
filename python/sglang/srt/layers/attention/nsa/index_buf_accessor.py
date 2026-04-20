@@ -364,17 +364,14 @@ def _set_k_and_s_triton(
         raise ValueError(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
-    if _is_hip:
-        assert buf_numel_per_page == 1 * (128 + 4)
-    else:
-        assert buf_numel_per_page == 64 * (128 + 4)
+    assert buf_numel_per_page == page_size * (128 + 4), (
+        f"buf_numel_per_page={buf_numel_per_page} != page_size*132 (page_size={page_size})"
+    )
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
-    if _is_hip:
-        assert page_size == 1
-    else:
-        assert page_size == 64
+    # NSA supports page_size=1 (ROCm default) or page_size=64 (CUDA / ROCm-HiSparse)
+    assert page_size in (1, 64), f"NSA only supports page_size in (1, 64), got {page_size}"
 
     assert buf.dtype == torch.uint8
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
