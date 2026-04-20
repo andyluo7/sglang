@@ -277,7 +277,27 @@ class HiSparseCoordinator:
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs = []
-        if len(self.ack_staging_queue) == 0:
+
+        # ROCm-safe collective gating: all TP ranks must agree on whether to
+        # enter the staging-queue all_reduce below. HiSparse top-k selection
+        # is per-rank (each rank sees only its sharded attention heads), so
+        # the staging queue can have different lengths across ranks: one rank
+        # may have empty queue while others still have pending host->device
+        # copies. The original code path early-returned when the queue was
+        # empty *without* calling the all_reduce, causing NCCL/RCCL ordering
+        # mismatches that would deadlock until the watchdog killed a TP rank.
+        # On CUDA, finish_event.query() resolved fast enough that this race
+        # rarely surfaced; on HIP, the timing variance exposes it reliably.
+        has_work = torch.tensor(
+            int(len(self.ack_staging_queue) > 0), dtype=torch.int, device="cpu"
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                has_work,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        if has_work.item() == 0:
             return ready_reqs
 
         finish_count = 0
