@@ -1854,10 +1854,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        if _is_hip:
-            assert self.page_size == 1
-        else:
-            assert self.page_size == 64
+        # Page-size policy:
+        #   * CUDA: 64 (FlashMLA-Sparse / paged NSA backends)
+        #   * ROCm: 1 by default (aiter MLA decode kernels), 64 when HiSparse
+        #     is enabled (HiSparseAllocator requires page_size > 1, and the
+        #     index_k_with_scale_buffer layout below is page_size-parametric).
+        assert self.page_size in (1, 64), (
+            f"NSATokenToKVPool only supports page_size in (1, 64), got {self.page_size}"
+        )
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool

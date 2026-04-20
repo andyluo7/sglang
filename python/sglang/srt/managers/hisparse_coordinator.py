@@ -11,11 +11,15 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_hip, is_npu
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+if not is_npu() and not is_hip():
+    from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+else:
+    # NPU and HIP/ROCm: JIT CUDA kernel is unavailable; fall back to naive_load_topk.
+    load_cache_to_device_buffer_mla = None
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -277,7 +281,27 @@ class HiSparseCoordinator:
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs = []
-        if len(self.ack_staging_queue) == 0:
+
+        # ROCm-safe collective gating: all TP ranks must agree on whether to
+        # enter the staging-queue all_reduce below. HiSparse top-k selection
+        # is per-rank (each rank sees only its sharded attention heads), so
+        # the staging queue can have different lengths across ranks: one rank
+        # may have empty queue while others still have pending host->device
+        # copies. The original code path early-returned when the queue was
+        # empty *without* calling the all_reduce, causing NCCL/RCCL ordering
+        # mismatches that would deadlock until the watchdog killed a TP rank.
+        # On CUDA, finish_event.query() resolved fast enough that this race
+        # rarely surfaced; on HIP, the timing variance exposes it reliably.
+        has_work = torch.tensor(
+            int(len(self.ack_staging_queue) > 0), dtype=torch.int, device="cpu"
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                has_work,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        if has_work.item() == 0:
             return ready_reqs
 
         finish_count = 0
@@ -671,6 +695,15 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
+        # On HIP/ROCm, fall back to naive per-request loop since JIT CUDA kernel is unavailable.
+        # Mirrors the NPU path established in PR #22978.
+        if is_hip():
+            return self.naive_load_topk(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_tokens=top_k_result,
+                layer_id=layer_id,
+            )
         # todo, adjustable for performance
         block_size = 1024
         load_cache_to_device_buffer_mla(

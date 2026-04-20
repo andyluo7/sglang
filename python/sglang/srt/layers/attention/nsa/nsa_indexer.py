@@ -429,13 +429,16 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
-        if _is_hip:
-            assert page_size == 1, "only support page size 1"
+        # ROCm with HiSparse uses page_size=64 (same path as CUDA).
+        if page_size == 1:
             block_tables = metadata.get_page_table_1()
-        else:
-            assert page_size == 64, "only support page size 64"
-            # NOTE(dark): this support extend/decode/decode+graph
+        elif page_size == 64:
+            # NOTE(dark): this supports extend/decode/decode+graph
             block_tables = metadata.get_page_table_64()
+        else:
+            raise AssertionError(
+                f"NSA indexer supports page_size in (1, 64), got {page_size}"
+            )
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -462,7 +465,10 @@ class Indexer(MultiPlatformOp):
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 1 if _is_hip else 64
+        # PR1 (HiSparse on ROCm): block_kv must follow the actual page_size,
+        # not be hard-coded by platform. Without HiSparse, ROCm uses page_size=1
+        # and CUDA uses page_size=64; with HiSparse on ROCm, page_size becomes 64.
+        block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = 132
         if _is_hip:
@@ -560,10 +566,9 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        if _is_hip:
-            assert page_size == 1, "only support page size 1"
-        else:
-            assert page_size == 64, "only support page size 64"
+        assert page_size in (1, 64), (
+            f"NSA indexer supports page_size in (1, 64), got {page_size}"
+        )
 
         assert len(weights.shape) == 3
         assert (
@@ -572,7 +577,7 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip:
+        if page_size == 1:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()

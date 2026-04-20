@@ -37,9 +37,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -934,6 +935,16 @@ class MLATokenToKVPoolHost(HostKVCache):
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
                     )
+                elif _is_hip:
+                    # ROCm/HIP fallback: pure-PyTorch indexed copy. The TVM JIT
+                    # kernel and the sgl_kernel transfer_kv_per_layer_mla CUDA op
+                    # are unavailable on AMD; mirrors PR #22978's NPU pattern.
+                    _hi = host_indices.to(self.kv_buffer[layer_id].device, non_blocking=True)                         if host_indices.device != self.kv_buffer[layer_id].device else host_indices
+                    _di = device_indices.to(device_pool.kv_buffer[layer_id].device, non_blocking=True)                         if device_indices.device != device_pool.kv_buffer[layer_id].device else device_indices
+                    _src = self.kv_buffer[layer_id][_hi].to(
+                        device_pool.kv_buffer[layer_id].device, non_blocking=True
+                    )
+                    device_pool.kv_buffer[layer_id][_di] = _src
                 else:
                     transfer_kv_per_layer_mla(
                         src=self.kv_buffer[layer_id],
@@ -1019,6 +1030,17 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
+                elif _is_hip:
+                    # ROCm/HIP fallback: pure-PyTorch indexed copy across all layers.
+                    _hi = host_indices.to(self.kv_buffer[0].device, non_blocking=True) \
+                        if host_indices.device != self.kv_buffer[0].device else host_indices
+                    for _lid in range(self.layer_num):
+                        _di = device_indices.to(device_pool.kv_buffer[_lid].device, non_blocking=True) \
+                            if device_indices.device != device_pool.kv_buffer[_lid].device else device_indices
+                        _kv = device_pool.kv_buffer[_lid][_di].to(
+                            self.kv_buffer[_lid].device, non_blocking=True
+                        )
+                        self.kv_buffer[_lid][_hi] = _kv
                 else:
                     transfer_kv_all_layer_mla(
                         src_layers=device_pool.data_ptrs,
