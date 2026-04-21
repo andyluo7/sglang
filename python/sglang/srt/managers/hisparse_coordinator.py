@@ -524,6 +524,31 @@ class HiSparseCoordinator:
         top_k_indices[mask] = -1
         return top_k_indices
 
+    def fast_load_topk(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized, graph-capturable top-k device-index gather.
+
+        Assumes all sequences fit entirely in the device buffer
+        (seq_len <= self.device_buffer_size). Uses pure tensor ops with
+        no .item() calls so it is safe for cuda-graph capture on HIP.
+
+        Returns: int32 (num_reqs, top_k) device indices, with -1 for
+        invalid positions (negative or >= seq_len).
+        """
+        # Per-request: device_indices[i, j] = req_to_device_buffer[req_pool_indices[i], top_k_tokens[i, j]]
+        num_reqs = req_pool_indices.size(0)
+        # Clamp to safe index, then mask out
+        safe_topk = top_k_tokens.clamp(min=0).to(torch.int64)
+        rows = req_pool_indices.unsqueeze(1).expand(-1, self.top_k)
+        gathered = self.req_to_device_buffer[rows, safe_topk]
+        # Mask: invalid where top_k_tokens < 0 OR >= seq_lens
+        valid = (top_k_tokens >= 0) & (top_k_tokens < seq_lens.unsqueeze(1).to(top_k_tokens.dtype))
+        return torch.where(valid, gathered.to(torch.int32), torch.full_like(gathered, -1, dtype=torch.int32))
+
     def naive_load_topk(
         self,
         req_pool_indices: torch.Tensor,
@@ -698,11 +723,34 @@ class HiSparseCoordinator:
         # On HIP/ROCm, fall back to naive per-request loop since JIT CUDA kernel is unavailable.
         # Mirrors the NPU path established in PR #22978.
         if is_hip():
-            return self.naive_load_topk(
+            # Vectorized fast path: graph-capturable, assumes seq_len fits in
+            # device_buffer_size. For long sequences the fast path is
+            # incorrect (misses host-loaded tokens); the slow naive_load_topk
+            # would be needed but is not graph-capturable. As a pragmatic
+            # compromise we use fast_load_topk under cuda-graph capture or
+            # when all sequences fit; otherwise fall back to naive_load_topk.
+            try:
+                _is_capturing = torch.cuda.is_current_stream_capturing()
+            except Exception:
+                _is_capturing = False
+            if _is_capturing:
+                return self.fast_load_topk(
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    top_k_tokens=top_k_result,
+                )
+            # Eager: pick fast vs naive based on whether any seq exceeds buffer
+            if bool((seq_lens > self.device_buffer_size).any().item()):
+                return self.naive_load_topk(
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    top_k_tokens=top_k_result,
+                    layer_id=layer_id,
+                )
+            return self.fast_load_topk(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 top_k_tokens=top_k_result,
-                layer_id=layer_id,
             )
         # todo, adjustable for performance
         block_size = 1024

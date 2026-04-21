@@ -939,10 +939,10 @@ class MLATokenToKVPoolHost(HostKVCache):
                     # ROCm/HIP fallback: pure-PyTorch indexed copy. The TVM JIT
                     # kernel and the sgl_kernel transfer_kv_per_layer_mla CUDA op
                     # are unavailable on AMD; mirrors PR #22978's NPU pattern.
-                    _hi = host_indices.to(self.kv_buffer[layer_id].device, non_blocking=True)                         if host_indices.device != self.kv_buffer[layer_id].device else host_indices
-                    _di = device_indices.to(device_pool.kv_buffer[layer_id].device, non_blocking=True)                         if device_indices.device != device_pool.kv_buffer[layer_id].device else device_indices
+                    _hi = host_indices.to(self.kv_buffer[layer_id].device, non_blocking=False)                         if host_indices.device != self.kv_buffer[layer_id].device else host_indices
+                    _di = device_indices.to(device_pool.kv_buffer[layer_id].device, non_blocking=False)                         if device_indices.device != device_pool.kv_buffer[layer_id].device else device_indices
                     _src = self.kv_buffer[layer_id][_hi].to(
-                        device_pool.kv_buffer[layer_id].device, non_blocking=True
+                        device_pool.kv_buffer[layer_id].device, non_blocking=False
                     )
                     device_pool.kv_buffer[layer_id][_di] = _src
                 else:
@@ -1032,13 +1032,13 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
                 elif _is_hip:
                     # ROCm/HIP fallback: pure-PyTorch indexed copy across all layers.
-                    _hi = host_indices.to(self.kv_buffer[0].device, non_blocking=True) \
+                    _hi = host_indices.to(self.kv_buffer[0].device, non_blocking=False) \
                         if host_indices.device != self.kv_buffer[0].device else host_indices
                     for _lid in range(self.layer_num):
-                        _di = device_indices.to(device_pool.kv_buffer[_lid].device, non_blocking=True) \
+                        _di = device_indices.to(device_pool.kv_buffer[_lid].device, non_blocking=False) \
                             if device_indices.device != device_pool.kv_buffer[_lid].device else device_indices
                         _kv = device_pool.kv_buffer[_lid][_di].to(
-                            self.kv_buffer[_lid].device, non_blocking=True
+                            self.kv_buffer[_lid].device, non_blocking=False
                         )
                         self.kv_buffer[_lid][_hi] = _kv
                 else:

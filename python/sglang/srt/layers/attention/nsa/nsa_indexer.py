@@ -465,10 +465,15 @@ class Indexer(MultiPlatformOp):
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        # PR1 (HiSparse on ROCm): block_kv must follow the actual page_size,
-        # not be hard-coded by platform. Without HiSparse, ROCm uses page_size=1
-        # and CUDA uses page_size=64; with HiSparse on ROCm, page_size becomes 64.
-        block_kv = page_size
+        # On HIP, the AITER pa_mqa_logits Triton kernel hard-asserts
+        # KVBlockSize == 1, so we must pass token-level block tables on HIP
+        # regardless of the pool page_size. The pool storage is still flat
+        # per-token so this is correct.
+        if _is_hip:
+            block_kv = 1
+            block_tables = metadata.get_page_table_1()
+        else:
+            block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = 132
         if _is_hip:
