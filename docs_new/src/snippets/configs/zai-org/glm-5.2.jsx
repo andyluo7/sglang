@@ -94,7 +94,7 @@ sgl-eval run aime25 \\
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260630",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
@@ -153,9 +153,10 @@ sgl-eval run aime25 \\
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6",
+                  "--disable-overlap-schedule"],
+          disable: { hw: ["mi325x", "mi300x"] },
+          disableReason: "MTP/EAGLE on AMD is validated on MI355X (gfx950, FP8) with the v0.5.14 image (#29373) plus --disable-overlap-schedule (works around the spec-v2 ROCm DSA draft-extend bug, sgl-project/sglang#29785). Not yet validated on gfx942 (MI300X/MI325X), and not supported for the MXFP4 build (its bf16 MTP layer does not load into the MXFP4 draft model)." },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
@@ -817,10 +818,11 @@ sgl-eval run aime25 \\
     //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
-    // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is
-    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 was re-validated
-    // (GSM8K ~0.96, NIAH 15/15 to ~118K) and all three FP8 strategies are benchmarked
-    // + marked verified:true (see glm-5.2-benchmarks.jsx). All BF16 and all gfx942
+    // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is fixed
+    // as of the pinned mi355x image (v0.5.14-rocm720-mi35x-20260630). MI355X FP8 was
+    // re-validated (GSM8K ~0.96, NIAH 15/15 to ~118K); all three FP8 strategies are
+    // benchmarked + verified:true. Low-latency now uses EAGLE MTP 5-1-6 (validated on
+    // gfx950 via #29373 + --disable-overlap-schedule, see #29785). All BF16 and all gfx942
     // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
     // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
     // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
@@ -828,12 +830,19 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      // EAGLE MTP 5-1-6: validated on gfx950 FP8 (v0.5.14, #29373). --disable-overlap-schedule
+      // is required to dodge the v0.5.14 spec-v2 ROCm DSA draft-extend bug (sgl-project/sglang#29785).
+      env: ["SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--disable-overlap-schedule",
         "--chunked-prefill-size 131072",
         "--mem-fraction-static 0.80",
         "--watchdog-timeout 1200",
