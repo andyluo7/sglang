@@ -822,7 +822,9 @@ sgl-eval run aime25 \\
     // as of the pinned mi355x image (v0.5.14-rocm720-mi35x-20260630). MI355X FP8 was
     // re-validated (GSM8K ~0.96, NIAH 15/15 to ~118K); all three FP8 strategies are
     // benchmarked + verified:true. Low-latency now uses EAGLE MTP 5-1-6 (validated on
-    // gfx950 via #29373 + --disable-overlap-schedule, see #29785). All BF16 and all gfx942
+    // gfx950 via #29373 + --disable-overlap-schedule, see #29785). All 3 FP8 cells use fp8 KV
+    // (--kv-cache-dtype fp8_e4m3 + SGLANG_ROCM_FUSED_DECODE_MLA=0): +21-46% throughput, GSM8K
+    // -1319 unchanged (0.946 vs 0.945 bf16). All BF16 and all gfx942
     // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
     // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
     // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
@@ -832,12 +834,14 @@ sgl-eval run aime25 \\
       verified: true,
       // EAGLE MTP 5-1-6: validated on gfx950 FP8 (v0.5.14, #29373). --disable-overlap-schedule
       // is required to dodge the v0.5.14 spec-v2 ROCm DSA draft-extend bug (sgl-project/sglang#29785).
-      env: ["SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA=1"],
+      // fp8 KV + FUSED_DECODE_MLA=0: faster decode, GSM8K-1319 unchanged (0.946 vs 0.945 bf16).
+      env: ["SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA=1", "SGLANG_ROCM_FUSED_DECODE_MLA=0"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype fp8_e4m3",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -853,12 +857,13 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_ROCM_FUSED_DECODE_MLA=0"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 128",
@@ -871,12 +876,13 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_ROCM_FUSED_DECODE_MLA=0"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
         "--max-running-requests 256",

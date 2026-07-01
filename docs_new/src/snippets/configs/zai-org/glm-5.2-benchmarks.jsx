@@ -169,19 +169,20 @@ export const benchmarks = [
         ttft_ms: 6370, tpot_ms: 280, tokens_per_sec_per_gpu: 430 },
     ],
   },
-  // ---- MI355X + FP8 ----  gfx950, TP8, DSA tilelang. Measured on MI350X (gfx950, ~1000W;
-  // a true MI355X at ~1400W will be somewhat faster), image
-  // lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260630, --random-range-ratio 1.0, flush-cache.
-  // low-latency = EAGLE MTP 5-1-6 (+--disable-overlap-schedule; accept length ~3-5, real run,
-  // no SIMULATE_ACC_LEN); balanced/high-throughput = no MTP.
+  // ---- MI355X + FP8 ----  gfx950, TP8, DSA tilelang, fp8 KV (--kv-cache-dtype fp8_e4m3 +
+  // SGLANG_ROCM_FUSED_DECODE_MLA=0). Measured on MI350X (gfx950, ~1000W; a true MI355X at
+  // ~1400W will be somewhat faster), image lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260630,
+  // --random-range-ratio 1.0, flush-cache. fp8 KV vs bf16 KV: +21-46% throughput, GSM8K-1319
+  // unchanged (0.946 vs 0.945). low-latency = EAGLE MTP 5-1-6 (+--disable-overlap-schedule;
+  // accept length ~3-5, real run, no SIMULATE_ACC_LEN); balanced/high-throughput = no MTP.
   {
     match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.14",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 649, tpot_ms: 4.29, tokens_per_sec_per_gpu: 25 },
+        ttft_ms: 494, tpot_ms: 3.83, tokens_per_sec_per_gpu: 29 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 2682, tpot_ms: 15.01, tokens_per_sec_per_gpu: 105 },
+        ttft_ms: 2042, tpot_ms: 11.82, tokens_per_sec_per_gpu: 139 },
     ],
   },
   {
@@ -189,9 +190,9 @@ export const benchmarks = [
     sglang_version: "0.5.14",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
-        ttft_ms: 19754, tpot_ms: 46.40, tokens_per_sec_per_gpu: 122 },
+        ttft_ms: 14945, tpot_ms: 39.54, tokens_per_sec_per_gpu: 148 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
-        ttft_ms: 178228, tpot_ms: 57.70, tokens_per_sec_per_gpu: 120 },
+        ttft_ms: 127542, tpot_ms: 45.76, tokens_per_sec_per_gpu: 151 },
     ],
   },
   {
@@ -199,7 +200,7 @@ export const benchmarks = [
     sglang_version: "0.5.14",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 434731, tpot_ms: 107.40, tokens_per_sec_per_gpu: 140 },
+        ttft_ms: 298854, tpot_ms: 100.56, tokens_per_sec_per_gpu: 204 },
     ],
   },
 ];
