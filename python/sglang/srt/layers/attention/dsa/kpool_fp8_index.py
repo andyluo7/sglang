@@ -10,6 +10,12 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.utils import is_hip
 
+# Budget for the masked-logits temporary inside `_topk_unfused`, passed only from
+# the ROCm path below. It scales with prefill_chunk x pooled_history, so at large
+# context a single 16k-token chunk wanted 10 GiB. CUDA callers pass nothing and
+# keep the untiled path.
+ROCM_TOPK_MASK_BUDGET_BYTES = 1 << 30  # 1 GiB
+
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -428,8 +434,19 @@ def expand_pooled_groups_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Expand selected full-pool ids to a strict-width token topk tensor."""
+    """Expand selected full-pool ids to a strict-width token topk tensor.
+
+    ``page_table_row_index`` maps each output row to a page-table row. Passing it
+    is equivalent to passing ``page_table.index_select(0, page_table_row_index)``
+    and nothing else, but it does not materialize that gather. The page table
+    holds one row per request while this call has one row per token-group, so the
+    eager form replicates a table of a few hundred KiB once per row: at 1M context
+    that reached 64 GiB for a single 16k-token chunk and OOMed every TP rank. The
+    row term is applied in the indexing below instead, leaving the (rows, topk)
+    output as the only allocation -- which was always required.
+    """
     assert group_ids.ndim == 2
     assert group_valid.shape == group_ids.shape
     assert topk % pool_size == 0
@@ -448,9 +465,18 @@ def expand_pooled_groups_to_topk(
 
     if page_table is not None:
         assert page_table.ndim == 2
-        assert page_table.shape[0] == group_ids.shape[0]
         safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
-        output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        if page_table_row_index is None:
+            assert page_table.shape[0] == group_ids.shape[0]
+            output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        else:
+            assert page_table_row_index.shape[0] == group_ids.shape[0]
+            rows = page_table_row_index.to(
+                dtype=torch.int64, device=page_table.device
+            ).unsqueeze(1)
+            # Broadcasts against safe_ids, so the row term costs a view rather
+            # than a gathered copy of the page table.
+            output = page_table[rows, safe_ids].to(torch.int32)
     elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
             assert topk_offsets.shape[1] == 1
@@ -470,8 +496,15 @@ def append_kpool_tail_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Append non-pooled tail tokens after selected expanded-history tokens."""
+    """Append non-pooled tail tokens after selected expanded-history tokens.
+
+    ``page_table_row_index`` maps output rows to page-table rows and is applied
+    inside the kernel, so the caller never materializes
+    ``page_table.index_select(0, page_table_row_index)``. See
+    ``expand_pooled_groups_to_topk`` for why that gather is worth avoiding.
+    """
     assert topk_result.dtype == torch.int32
     assert seq_lens.ndim == 1
     assert pool_lens.ndim == 1
@@ -497,6 +530,16 @@ def append_kpool_tail_to_topk(
         has_page_table = True
         page_table_cols = page_table.shape[1]
 
+    has_row_index = has_page_table and page_table_row_index is not None
+    if has_row_index:
+        assert page_table_row_index.shape[0] == rows
+        page_table_row_index = page_table_row_index.to(
+            dtype=torch.int64, device=page_table.device
+        ).contiguous()
+    else:
+        # Unused by the kernel, but Triton still needs a real pointer.
+        page_table_row_index = seq_lens
+
     if topk_offsets is None:
         topk_offsets = seq_lens
         has_topk_offsets = False
@@ -514,6 +557,7 @@ def append_kpool_tail_to_topk(
         pool_lens,
         page_table,
         topk_offsets,
+        page_table_row_index,
         out,
         topk_result.stride(0),
         topk_result.stride(1),
@@ -527,6 +571,7 @@ def append_kpool_tail_to_topk(
         POOL_SIZE=pool_size,
         HAS_PAGE_TABLE=has_page_table,
         HAS_TOPK_OFFSETS=has_topk_offsets,
+        HAS_ROW_INDEX=has_row_index,
         BLOCK_COLS=block_cols,
     )
     return out
@@ -539,6 +584,7 @@ def _append_kpool_tail_to_topk_kernel(
     pool_lens_ptr,
     page_table_ptr,
     topk_offsets_ptr,
+    page_table_row_index_ptr,
     out_ptr,
     topk_stride_0,
     topk_stride_1,
@@ -552,6 +598,7 @@ def _append_kpool_tail_to_topk_kernel(
     POOL_SIZE: tl.constexpr,
     HAS_PAGE_TABLE: tl.constexpr,
     HAS_TOPK_OFFSETS: tl.constexpr,
+    HAS_ROW_INDEX: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -581,9 +628,14 @@ def _append_kpool_tail_to_topk_kernel(
         # int64 row term: the wide page table's row stride is context-scale
         # (~2^20 on 1M-context models), so row * stride wraps int32 from
         # row ~2048 — same promotion as the fused metadata kernels.
+        # Row indirection here rather than in a gathered copy of the page
+        # table; see append_kpool_tail_to_topk.
+        pt_row = row.to(tl.int64)
+        if HAS_ROW_INDEX:
+            pt_row = tl.load(page_table_row_index_ptr + row).to(tl.int64)
         tail_value = tl.load(
             page_table_ptr
-            + row.to(tl.int64) * page_table_stride_0
+            + pt_row * page_table_stride_0
             + safe_tail * page_table_stride_1,
             mask=mask & is_tail,
             other=-1,
@@ -747,15 +799,13 @@ def _topk_from_pooled_history_logits_unfused(
         row_starts=row_starts,
         topk_op=torch.topk,
         topk_op_kwargs={"dim": -1},
+        max_mask_bytes=ROCM_TOPK_MASK_BUDGET_BYTES,
     )
     group_valid = selected_groups >= 0
 
+    # The row term is threaded through to both consumers instead of being baked
+    # into a gathered copy of the page table.
     page_table_for_rows = page_table
-    if page_table_row_index is not None:
-        assert page_table is not None
-        page_table_for_rows = page_table.index_select(
-            0, page_table_row_index.to(dtype=torch.int64, device=page_table.device)
-        )
 
     expanded = expand_pooled_groups_to_topk(
         selected_groups.contiguous(),
@@ -764,6 +814,7 @@ def _topk_from_pooled_history_logits_unfused(
         pool_size=pool_size,
         page_table=page_table_for_rows,
         topk_offsets=topk_offsets,
+        page_table_row_index=page_table_row_index,
     )
     if seq_lens is None:
         result = expanded
@@ -775,6 +826,7 @@ def _topk_from_pooled_history_logits_unfused(
             pool_size=pool_size,
             page_table=page_table_for_rows,
             topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
         )
     if out_rows is None or out_rows == result.shape[0]:
         return result

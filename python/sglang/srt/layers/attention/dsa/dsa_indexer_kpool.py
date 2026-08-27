@@ -782,6 +782,25 @@ class IndexerKPool(MultiPlatformOp):
 
         attn_metadata = metadata.attn_metadata
         plan = attn_metadata.kpool_write_plan
+        # `plan.pool_seqlens_per_q` is written by the CAPTURED write-plan kernel,
+        # so inside the out-of-graph replay body it still holds the PREVIOUS
+        # replay's values (see the residual builder in dsa_backend, which rebuilds
+        # both schedule sources from raw seq_lens for exactly this reason).
+        #
+        # On CUDA that staleness is invisible: DeepGEMM consumes
+        # `pool_schedule_metadata`, which the residual refreshes out-of-graph. ROCm
+        # builds no schedule at all (`build_schedule_metadata` is False once aiter
+        # or tilelang paged-MQA is selected), so the residual's refresh is skipped
+        # AND aiter is handed `pool_seqlens_per_q` directly -- one replay stale.
+        # That feeds the wrong KV extent to the paged-MQA logits and the verify
+        # top-k then selects the wrong tokens: measured as needle retrieval
+        # collapsing to 1/4 with draft acceptance stuck at 0.14.
+        #
+        # Recompute it from `seqlens_32` instead, which for target_verify is the
+        # per-q expanded `seq_lens + [1..next_n]`, making this exactly the closed
+        # form the captured kernel writes: `(seq_lens + k + 1) // pool_size`.
+        if is_hip() and plan is not None and plan.pool_schedule_metadata is None:
+            plan = None
         if plan is not None and plan.pool_seqlens_per_q is not None:
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
@@ -1542,7 +1561,7 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify needs CUDA or ROCm"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
