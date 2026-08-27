@@ -10,6 +10,12 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.utils import is_hip
 
+# Budget for the masked-logits temporary inside `_topk_unfused`, passed only from
+# the ROCm path below. It scales with prefill_chunk x pooled_history, so at large
+# context a single 16k-token chunk wanted 10 GiB. CUDA callers pass nothing and
+# keep the untiled path.
+ROCM_TOPK_MASK_BUDGET_BYTES = 1 << 30  # 1 GiB
+
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -790,6 +796,7 @@ def _topk_from_pooled_history_logits_unfused(
         row_starts=row_starts,
         topk_op=torch.topk,
         topk_op_kwargs={"dim": -1},
+        max_mask_bytes=ROCM_TOPK_MASK_BUDGET_BYTES,
     )
     group_valid = selected_groups >= 0
 

@@ -240,6 +240,7 @@ def _topk_unfused(
     row_starts: Optional[torch.Tensor] = None,
     topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
     topk_op_kwargs: Optional[Dict[str, object]] = None,
+    max_mask_bytes: Optional[int] = None,
 ) -> torch.Tensor:
     batch_size, max_score_len = score.shape
     topk_indices = score.new_full((batch_size, topk), -1, dtype=torch.int32)
@@ -256,13 +257,47 @@ def _topk_unfused(
     col_indices = col_indices.unsqueeze(0)
     row_starts_unsqueezed = row_starts.unsqueeze(1)
     row_ends_unsqueezed = (row_starts + lengths).unsqueeze(1)
+    valid_topk = min(topk, max_score_len)
+    topk_kwargs = topk_op_kwargs or {}
+
+    # Opt-in only, and only when the single-pass temporaries would exceed the
+    # caller's budget. Everything below this block is the original path, byte for
+    # byte, so callers that do not pass `max_mask_bytes` -- which today is every
+    # caller except the ROCm one -- keep their exact shapes and therefore their
+    # exact tie-breaking. That matters for the flashinfer backend, which asks for
+    # `deterministic` and a specific `tie_break` and runs with `dsa_graph_safe`.
+    #
+    # The single-pass form builds a (rows, max_score_len) bool twice (`valid_mask`
+    # and `~valid_mask`) plus a full float copy of `score`, all scaling with
+    # prefill_chunk x pooled_history. At 1M context that copy alone reached 10 GiB
+    # for one 16k-token chunk and OOMed every TP rank. Top-k is applied per row,
+    # so tiling over rows changes no result; it only caps how much exists at once.
+    if max_mask_bytes is not None:
+        bytes_per_row = max(max_score_len * score.element_size(), 1)
+        if batch_size * bytes_per_row > max_mask_bytes:
+            rows_per_tile = min(max(1, max_mask_bytes // bytes_per_row), batch_size)
+            for lo in range(0, batch_size, rows_per_tile):
+                hi = min(lo + rows_per_tile, batch_size)
+                tile_starts = row_starts_unsqueezed[lo:hi]
+                tile_invalid = (col_indices < tile_starts) | (
+                    col_indices >= row_ends_unsqueezed[lo:hi]
+                )
+                tile_masked = score[lo:hi].masked_fill(tile_invalid, float("-inf"))
+                tile_scores, tile_cols = topk_op(
+                    tile_masked, valid_topk, **topk_kwargs
+                )
+                tile_local = tile_cols.to(torch.int32) - tile_starts
+                tile_local = tile_local.masked_fill(
+                    tile_scores == float("-inf"), -1
+                )
+                topk_indices[lo:hi, :valid_topk] = tile_local
+            return topk_indices
+
     valid_mask = (col_indices >= row_starts_unsqueezed) & (
         col_indices < row_ends_unsqueezed
     )
 
     masked_logits = score.masked_fill(~valid_mask, float("-inf"))
-    valid_topk = min(topk, max_score_len)
-    topk_kwargs = topk_op_kwargs or {}
     topk_scores, topk_col_indices = topk_op(masked_logits, valid_topk, **topk_kwargs)
     topk_local_indices = topk_col_indices.to(torch.int32) - row_starts_unsqueezed
     topk_local_indices = topk_local_indices.masked_fill(
